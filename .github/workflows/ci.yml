@@ -49,6 +49,7 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: true
+          cache-version: ${{ matrix.rails-version-env }}
       - name: Update bundle
         run: ${{ matrix.rails-version-env }} bundle update
       - name: Run tests
