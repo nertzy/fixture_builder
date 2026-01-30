@@ -31,7 +31,7 @@ The best of all worlds!
   # Gemfile
   group :development, :test do
     gem 'fixture_builder'
-
+  end
   ```
 
 1.  Create a file which configures and declares your fixtures (see below for examples)
@@ -148,7 +148,7 @@ By default these are set as:
 - fixture_builder_file: RAILS_ROOT/tmp/fixture_builder.yml
 - record_name_fields: %w{ unique_name display_name name title username login }
 - skip_tables: %w{ schema_migrations ar_internal_metadata }
-- select_sql: SELECT \* FROM %{table}
+- select_sql: SELECT * FROM %{table}
 - delete_sql: DELETE FROM %{table}
 
 # Sequence Collisions
@@ -225,9 +225,9 @@ going to fall back to using FactoryGirl object mothers in addition to fixtures.
   ```ruby
   puts "\n== Building fixtures =="
   system! 'bin/rails spec:fixture_builder:rebuild'
-      puts "\n== Loading fixtures into dev database =="
-      system! 'bin/rails db:fixtures:load'
-      ```
+  puts "\n== Loading fixtures into dev database =="
+  system! 'bin/rails db:fixtures:load'
+  ```
 
 # More Complete Config Example
 
