@@ -111,9 +111,25 @@ module FixtureBuilder
           if table_klass && table_klass < ActiveRecord::Base
             rows = table_klass.unscoped do
               table_klass.order(:id).all.collect do |obj|
-                attrs = obj.attributes.select { |attr_name| table_klass.column_names.include?(attr_name) }
-                attrs.each_with_object({}) do |(attr_name, value), hash|
-                  hash[attr_name] = serialized_value_if_needed(table_klass, attr_name, value)
+                table_klass.column_names.each_with_object({}) do |attr_name, hash|
+                  column = table_klass.columns_hash[attr_name]
+                  attr_type = table_klass.type_for_attribute(attr_name)
+
+                  # For JSON/JSONB columns, use raw database value to avoid custom type objects
+                  # that would serialize with !ruby/object: YAML tags
+                  value = if column&.type.in?([:json, :jsonb]) || attr_type.type.in?([:json, :jsonb])
+                    raw_value = obj.read_attribute_before_type_cast(attr_name)
+                    # Parse JSON string to Hash/Array for proper YAML serialization
+                    case raw_value
+                    when String then JSON.parse(raw_value)
+                    when nil then nil
+                    else raw_value
+                    end
+                  else
+                    serialized_value_if_needed(table_klass, attr_name, obj[attr_name])
+                  end
+
+                  hash[attr_name] = value unless value.nil?
                 end
               end
             end
