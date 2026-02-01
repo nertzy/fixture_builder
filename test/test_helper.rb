@@ -29,6 +29,47 @@ end
 require 'sqlite3'
 require 'fixture_builder'
 
+class WizardData
+  attr_accessor :level, :title, :allies
+
+  def initialize(attrs = {})
+    @level = attrs['level'] || attrs[:level]
+    @title = attrs['title'] || attrs[:title]
+    @allies = attrs['allies'] || attrs[:allies] || []
+  end
+
+  def to_h
+    { 'level' => level, 'title' => title, 'allies' => allies }.compact
+  end
+end
+
+class WizardDataType < ActiveRecord::Type::Value
+  def type = :json
+
+  def cast(value)
+    case value
+    when WizardData then value
+    when Hash then WizardData.new(value)
+    when String then WizardData.new(JSON.parse(value))
+    when nil then nil
+    else raise ArgumentError, "Cannot cast #{value.class} to WizardData"
+    end
+  end
+
+  def serialize(value)
+    return nil if value.nil?
+
+    value.to_h.to_json
+  end
+
+  def deserialize(value)
+    return nil if value.nil?
+
+    data = value.is_a?(String) ? JSON.parse(value) : value
+    WizardData.new(data)
+  end
+end
+
 class MagicalCreature < ActiveRecord::Base
   validates_presence_of :name, :species
   serialize :powers, type: Array
@@ -36,6 +77,7 @@ class MagicalCreature < ActiveRecord::Base
   default_scope -> { where(deleted: false) }
 
   attribute :virtual, ActiveRecord::Type::Integer.new
+  attribute :wizard_data, WizardDataType.new
 end
 
 def create_and_blow_away_old_db
@@ -47,6 +89,7 @@ def create_and_blow_away_old_db
     t.column :name, :string
     t.column :species, :string
     t.column :powers, :string
+    t.column :wizard_data, :text
     t.column :deleted, :boolean, default: false, null: false
   end
 end

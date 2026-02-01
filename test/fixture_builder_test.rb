@@ -69,6 +69,33 @@ class FixtureBuilderTest < Test::Unit::TestCase
     assert !generated_fixture['uni'].key?('virtual')
   end
 
+  def test_custom_json_type_does_not_serialize_as_ruby_object
+    create_and_blow_away_old_db
+    force_fixture_generation
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        @gandalf = MagicalCreature.create!(
+          name: 'Gandalf',
+          species: 'wizard',
+          wizard_data: { 'level' => 99, 'title' => 'The Grey', 'allies' => %w[Frodo Aragorn] }
+        )
+      end
+    end
+
+    yaml_content = File.read(test_path('fixtures/magical_creatures.yml'))
+    refute_match(/!ruby\/object:/, yaml_content)
+
+    generated_fixture = YAML.load_file(test_path('fixtures/magical_creatures.yml'))
+    wizard_data = generated_fixture['gandalf']['wizard_data']
+    wizard_data = JSON.parse(wizard_data) if wizard_data.is_a?(String)
+
+    assert_equal 99, wizard_data['level']
+    assert_equal 'The Grey', wizard_data['title']
+    assert_equal %w[Frodo Aragorn], wizard_data['allies']
+  end
+
   def test_configure
     FixtureBuilder.configure do |config|
       assert config.is_a?(FixtureBuilder::Configuration)

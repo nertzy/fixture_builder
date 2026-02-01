@@ -111,9 +111,9 @@ module FixtureBuilder
           if table_klass && table_klass < ActiveRecord::Base
             rows = table_klass.unscoped do
               table_klass.order(:id).all.collect do |obj|
-                attrs = obj.attributes.select { |attr_name| table_klass.column_names.include?(attr_name) }
-                attrs.each_with_object({}) do |(attr_name, value), hash|
-                  hash[attr_name] = serialized_value_if_needed(table_klass, attr_name, value)
+                table_klass.column_names.each_with_object({}) do |attr_name, hash|
+                  value = obj.read_attribute_before_type_cast(attr_name)
+                  hash[attr_name] = value unless value.nil?
                 end
               end
             end
@@ -135,24 +135,6 @@ module FixtureBuilder
         Date::DATE_FORMATS[:default] = default_date_format
       end
       say "Built #{fixtures.to_sentence}"
-    end
-
-    def serialized_value_if_needed(table_klass, attr_name, value)
-      if table_klass.respond_to?(:type_for_attribute)
-        if table_klass.type_for_attribute(attr_name).type == :jsonb || table_klass.type_for_attribute(attr_name).type == :json
-          value
-        elsif table_klass.type_for_attribute(attr_name).respond_to?(:serialize)
-          table_klass.type_for_attribute(attr_name).serialize(value)
-        elsif table_klass.type_for_attribute(attr_name).respond_to?(:type_cast_for_database)
-          table_klass.type_for_attribute(attr_name).type_cast_for_database(value)
-        else
-          table_klass.type_for_attribute(attr_name).type_cast_for_schema(value)
-        end
-      elsif table_klass.serialized_attributes.key? attr_name
-        table_klass.serialized_attributes[attr_name].dump(value)
-      else
-        value
-      end
     end
 
     def write_fixture_file(fixture_data, table_name)
