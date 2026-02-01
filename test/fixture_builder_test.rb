@@ -51,8 +51,11 @@ class FixtureBuilderTest < Test::Unit::TestCase
                                        powers: %w[shading rooting seeding])
       end
     end
-    generated_fixture = YAML.load(File.open(test_path('fixtures/magical_creatures.yml')))
-    assert_equal "---\n- shading\n- rooting\n- seeding\n", generated_fixture['enty']['powers']
+
+    # Test round-trip through fixture loading
+    create_fixtures('magical_creatures')
+    loaded = MagicalCreature.find_by(name: 'Enty')
+    assert_equal %w[shading rooting seeding], loaded.powers
   end
 
   def test_do_not_include_virtual_attributes
@@ -67,6 +70,110 @@ class FixtureBuilderTest < Test::Unit::TestCase
     end
     generated_fixture = YAML.load(File.open(test_path('fixtures/magical_creatures.yml')))
     assert !generated_fixture['uni'].key?('virtual')
+  end
+
+  def test_json_backed_custom_type
+    create_and_blow_away_old_db
+    force_fixture_generation
+
+    original_data = WizardData.new({ 'level' => 99, 'title' => 'The Grey', 'allies' => %w[Frodo Aragorn] })
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        @gandalf = MagicalCreature.create!(
+          name: 'Gandalf',
+          species: 'wizard',
+          wizard_data: original_data
+        )
+      end
+    end
+
+    # Load fixtures and verify round-trip through ActiveRecord
+    create_fixtures('magical_creatures')
+    gandalf = MagicalCreature.find_by(name: 'Gandalf')
+
+    # Verify the custom object round-tripped correctly
+    assert_instance_of WizardData, gandalf.wizard_data
+    assert_equal original_data, gandalf.wizard_data
+    assert_equal original_data.inspect, gandalf.wizard_data.inspect
+
+    # Verify the data is correct
+    assert_equal 99, gandalf.wizard_data.level
+    assert_equal 'The Grey', gandalf.wizard_data.title
+    assert_equal %w[Frodo Aragorn], gandalf.wizard_data.allies
+  end
+
+  def test_json_column_with_custom_type
+    create_and_blow_away_old_db
+    force_fixture_generation
+
+    original_data = WizardData.new({ 'level' => 50, 'title' => 'Archmage', 'allies' => %w[Merlin Dumbledore] })
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        @sim_model = SimulationModel.create!(
+          name: 'Test Simulation',
+          configuration: original_data
+        )
+      end
+    end
+
+    # Verify the fixture YAML contains a Hash (not a JSON string)
+    generated_fixture = YAML.load(File.open(test_path('fixtures/simulation_models.yml')))
+    config_value = generated_fixture['sim_model']['configuration']
+    assert_instance_of Hash, config_value, "JSON column should serialize as Hash in YAML, not String"
+    assert_equal 50, config_value['level']
+    assert_equal 'Archmage', config_value['title']
+
+    # Load fixtures and verify round-trip through ActiveRecord
+    create_fixtures('simulation_models')
+    sim_model = SimulationModel.find_by(name: 'Test Simulation')
+
+    # Verify the custom object round-tripped correctly
+    assert_instance_of WizardData, sim_model.configuration
+    assert_equal original_data, sim_model.configuration
+
+    # Verify the data is correct
+    assert_equal 50, sim_model.configuration.level
+    assert_equal 'Archmage', sim_model.configuration.title
+    assert_equal %w[Merlin Dumbledore], sim_model.configuration.allies
+  end
+
+  def test_array_backed_custom_type
+
+    create_and_blow_away_old_db
+    force_fixture_generation
+
+    original_tags = TagList.new(%w[magic fantasy enchanted ancient])
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        @merlin = MagicalCreature.create!(
+          name: 'Merlin',
+          species: 'wizard',
+          tag_list: original_tags
+        )
+      end
+    end
+
+    # Load fixtures and verify round-trip through ActiveRecord
+    create_fixtures('magical_creatures')
+    merlin = MagicalCreature.find_by(name: 'Merlin')
+
+    # Verify the custom object round-tripped correctly
+    assert_instance_of TagList, merlin.tag_list
+    assert_equal original_tags, merlin.tag_list
+    assert_equal original_tags.inspect, merlin.tag_list.inspect
+
+    # Verify the data is correct (TagList normalizes by sorting)
+    assert_equal %w[ancient enchanted fantasy magic], merlin.tag_list.to_a
+    assert_equal 4, merlin.tag_list.size
+    assert merlin.tag_list.include?('magic')
+    assert merlin.tag_list.include?('ancient')
+    refute merlin.tag_list.include?('modern')
   end
 
   def test_configure
@@ -97,8 +204,11 @@ class FixtureBuilderTest < Test::Unit::TestCase
                                        powers: %w[shading rooting seeding])
       end
     end
-    generated_fixture = YAML.load(File.open(test_path('fixtures/magical_creatures.yml')))
-    assert_equal "---\n- shading\n- rooting\n- seeding\n", generated_fixture['enty']['powers']
+
+    # Test round-trip through fixture loading
+    create_fixtures('magical_creatures')
+    loaded = MagicalCreature.find_by(name: 'Enty')
+    assert_equal %w[shading rooting seeding], loaded.powers
   end
 
   def test_sha1_digests
