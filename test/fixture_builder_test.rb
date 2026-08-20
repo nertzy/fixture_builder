@@ -1,6 +1,9 @@
 # frozen_string_literal: false
 
 require File.expand_path(File.join(File.dirname(__FILE__), 'test_helper'))
+require 'rbconfig'
+require 'tmpdir'
+require 'timeout'
 
 class Model
   def self.table_name
@@ -9,7 +12,21 @@ class Model
 end
 
 class FixtureBuilderTest < Test::Unit::TestCase
+  ConcurrencyHarness = Struct.new(:directory, keyword_init: true) do
+    def source_path = File.join(directory, 'source.rb')
+    def fixture_directory = File.join(directory, 'fixtures')
+    def fixture_path = File.join(fixture_directory, 'records.yml')
+    def manifest_path = File.join(directory, 'state', 'fixture_builder.yml')
+    def lock_path = "#{File.expand_path(manifest_path)}.lock"
+    def marker_path = File.join(directory, 'builds.log')
+    def release_path = File.join(directory, 'release.log')
+  end
+  WorkerProcess = Struct.new(:pid, :log_path, keyword_init: true)
+  WorkerResult = Struct.new(:status, :output, keyword_init: true)
+
   def teardown
+    configuration = FixtureBuilder.instance_variable_get(:'@configuration')
+    FileUtils.rm_f(configuration.fixture_builder_lock_file) if configuration
     FixtureBuilder.instance_variable_set(:'@configuration', nil)
   end
 
@@ -211,21 +228,461 @@ class FixtureBuilderTest < Test::Unit::TestCase
     assert_equal %w[shading rooting seeding], loaded.powers
   end
 
-  def test_sha1_digests
+  def test_rebuilds_when_generated_fixture_hashes_differ
     create_and_blow_away_old_db
-    force_fixture_generation_due_to_differing_file_hashes
+    force_fixture_generation
 
-    FixtureBuilder.configure(use_sha1_digests: true) do |fbuilder|
+    FixtureBuilder.configure do |fbuilder|
       fbuilder.files_to_check += Dir[test_path('*.rb')]
       fbuilder.factory do
         @enty = MagicalCreature.create(name: 'Enty', species: 'ent',
                                        powers: %w[shading rooting seeding])
       end
-      first_modified_time = File.mtime(test_path('fixtures/magical_creatures.yml'))
+    end
+
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+    fixture_path = test_path('fixtures/magical_creatures.yml')
+    generated_fixture = YAML.load_file(fixture_path)
+    generated_fixture['enty']['retired_column'] = 'bogus'
+    File.write(fixture_path, generated_fixture.to_yaml)
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent',
+                                       powers: %w[shading rooting seeding])
+      end
+    end
+
+    regenerated_fixture = YAML.load_file(fixture_path)
+    assert_false regenerated_fixture['enty'].key?('retired_column')
+    assert_equal 'Enty', regenerated_fixture['enty']['name']
+    assert_equal 'ent', regenerated_fixture['enty']['species']
+
+    create_fixtures('magical_creatures')
+    loaded = MagicalCreature.find_by!(name: 'Enty')
+    assert_equal %w[shading rooting seeding], loaded.powers
+  end
+
+  def test_rebuilds_legacy_manifest_once_and_upgrades_it
+    create_and_blow_away_old_db
+    force_fixture_generation
+    builds = 0
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        builds += 1
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+      end
+    end
+
+    manifest_path = File.expand_path('../tmp/fixture_builder.yml', __dir__)
+    legacy_sources = YAML.load_file(manifest_path).fetch('sources')
+    File.write(manifest_path, legacy_sources.to_yaml)
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        builds += 1
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+      end
+    end
+
+    upgraded_manifest = YAML.load_file(manifest_path)
+    assert_equal 2, upgraded_manifest['version']
+    assert_equal legacy_sources, upgraded_manifest['sources']
+    assert_equal %w[magical_creatures.yml simulation_models.yml], upgraded_manifest['fixtures'].keys
+
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory do
+        builds += 1
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+      end
+    end
+    assert_equal 2, builds
+  end
+
+  def test_rebuilds_when_manifest_is_empty
+    assert_manifest_rebuilds('')
+  end
+
+  def test_rebuilds_when_manifest_is_false
+    assert_manifest_rebuilds("false\n")
+  end
+
+  def test_rebuilds_when_manifest_is_scalar
+    assert_manifest_rebuilds("scalar\n")
+  end
+
+  def test_rebuilds_when_current_manifest_shape_is_invalid
+    invalid_current = <<~YAML
+      ---
+      version: 2
+      sources: {}
+      fixtures: {}
+      1: invalid
+    YAML
+
+    assert_manifest_rebuilds(invalid_current)
+  end
+
+  def test_malformed_manifest_raises_without_running_factory
+    create_and_blow_away_old_db
+    manifest_path = File.expand_path('../tmp/fixture_builder.yml', __dir__)
+    File.write(manifest_path, "---\ninvalid: [\n")
+    factory_called = false
+
+    assert_raise(Psych::SyntaxError) do
+      FixtureBuilder.configure do |fbuilder|
+        fbuilder.files_to_check += Dir[test_path('*.rb')]
+        fbuilder.factory { factory_called = true }
+      end
+    end
+
+    assert_false factory_called
+  end
+
+  def test_rebuilds_when_manifest_disappears_during_preflight
+    create_and_blow_away_old_db
+    force_fixture_generation
+    builds = 0
+    factory = proc do
+      builds += 1
+      @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+    end
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory(&factory)
+    end
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      remove_manifest_before_read = Module.new do
+        define_method(:read_config) do
+          FileUtils.rm(fixture_builder_file)
+          super()
+        end
+      end
+      fbuilder.singleton_class.prepend(remove_manifest_before_read)
+      fbuilder.factory(&factory)
+    end
+
+    assert_equal 2, builds
+  end
+
+  def test_concurrent_rebuilds_publish_one_fixture_snapshot
+    with_concurrency_harness do |harness|
+      workers = []
+      holder = spawn_worker(harness, 'holder', 'holding', worker_number: '1')
+      workers << holder
+      wait_until { File.exist?(harness.marker_path) }
+      waiter = spawn_worker(harness, 'waiter', 'waiter', worker_number: '2')
+      workers << waiter
+      wait_for_worker_output(waiter, '=> waiting for fixture generation lock')
+      File.write(harness.release_path, "release\n")
+
+      results = workers.map { |worker| wait_for_worker(worker) }
+      results.each do |result|
+        assert_predicate result.status, :success?, result.output
+      end
+      assert_equal 1, File.readlines(harness.marker_path).length
+      assert_equal 1, results.last.output.scan('=> waiting for fixture generation lock').length
+      assert_equal 1, results.sum { |result| result.output.scan('=> rebuilding fixtures because').length }
+      assert_manifest_matches_harness(harness)
+      assert_path_exist harness.lock_path
+    ensure
+      workers&.each { |worker| terminate_worker(worker) }
+    end
+  end
+
+  def test_waiter_recomputes_source_hashes_under_lock
+    with_concurrency_harness do |harness|
+      workers = [
+        spawn_worker(harness, 'one', 'source_change', worker_number: '1'),
+        spawn_worker(harness, 'two', 'source_change', worker_number: '2')
+      ]
+      results = workers.map { |worker| wait_for_worker(worker) }
+
+      results.each do |result|
+        assert_predicate result.status, :success?, result.output
+      end
+      assert_equal 2, File.readlines(harness.marker_path).length
+      assert_manifest_matches_harness(harness)
+      assert_path_exist harness.lock_path
+    ensure
+      workers&.each { |worker| terminate_worker(worker) }
+    end
+  end
+
+  def test_waiter_rebuilds_after_first_builder_fails
+    with_concurrency_harness do |harness|
+      workers = []
+      failing_worker = spawn_worker(harness, 'failing', 'failing', worker_number: '1')
+      workers << failing_worker
+      wait_until { File.exist?(harness.marker_path) }
+      waiter = spawn_worker(harness, 'waiter', 'waiter', worker_number: '2')
+      workers << waiter
+      wait_for_worker_output(waiter, '=> waiting for fixture generation lock')
+      File.write(harness.release_path, "release\n")
+
+      failing_result = wait_for_worker(failing_worker)
+      waiter_result = wait_for_worker(waiter)
+
+      assert_false failing_result.status.success?, failing_result.output
+      assert_predicate waiter_result.status, :success?, waiter_result.output
+      assert_equal 2, File.readlines(harness.marker_path).length
+      assert_equal 1, waiter_result.output.scan('=> waiting for fixture generation lock').length
+      assert_manifest_matches_harness(harness)
+      assert_path_exist harness.lock_path
+    ensure
+      workers&.each { |worker| terminate_worker(worker) }
+    end
+  end
+
+  def test_fixture_builder_lock_file_uses_expanded_manifest_path
+    configuration = FixtureBuilder::Configuration.new
+    configuration.fixture_builder_file = Pathname.new('tmp/custom-fixture-builder.yml')
+    expected = "#{File.expand_path(configuration.fixture_builder_file)}.lock"
+    original_test_env_number = ENV.fetch('TEST_ENV_NUMBER', nil)
+    original_parallel_workers = ENV.fetch('PARALLEL_WORKERS', nil)
+
+    assert_equal expected, configuration.fixture_builder_lock_file
+    ENV['TEST_ENV_NUMBER'] = '7'
+    ENV['PARALLEL_WORKERS'] = '12'
+    assert_equal expected, configuration.fixture_builder_lock_file
+  ensure
+    ENV['TEST_ENV_NUMBER'] = original_test_env_number
+    ENV['PARALLEL_WORKERS'] = original_parallel_workers
+  end
+
+  def test_fresh_manifest_returns_without_acquiring_lock
+    create_and_blow_away_old_db
+    force_fixture_generation
+    builds = 0
+    lock_path = nil
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      lock_path = fbuilder.fixture_builder_lock_file
+      fbuilder.factory do
+        builds += 1
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+      end
+    end
+
+    assert_path_exist lock_path
+    FileUtils.rm(lock_path)
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory { builds += 1 }
+    end
+
+    assert_equal 1, builds
+    assert_path_not_exist lock_path
+  end
+
+  def test_skips_rebuild_for_valid_empty_fixture_snapshot
+    create_and_blow_away_old_db
+    force_fixture_generation
+    fixture_snapshot = Dir[test_path('fixtures/*.yml')].to_h do |filename|
+      [filename, File.binread(filename)]
+    end
+    FileUtils.rm_f(Dir[test_path('fixtures/*.yml')])
+    builds = 0
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.write_empty_files = false
+      fbuilder.factory { builds += 1 }
+    end
+
+    manifest_path = File.expand_path('../tmp/fixture_builder.yml', __dir__)
+    assert_empty YAML.safe_load_file(manifest_path).fetch('fixtures')
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.write_empty_files = false
+      fbuilder.factory { builds += 1 }
+    end
+
+    assert_equal 1, builds
+  ensure
+    current_fixtures = Dir[test_path('fixtures/*.yml')]
+    FileUtils.rm_f(current_fixtures - fixture_snapshot.keys) if fixture_snapshot
+    fixture_snapshot&.each { |filename, contents| File.binwrite(filename, contents) }
+  end
+
+  def test_raising_after_build_invalidates_manifest_and_retries
+    create_and_blow_away_old_db
+    force_fixture_generation
+    builds = 0
+    factory = proc do
+      builds += 1
+      @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+    end
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory(&factory)
+    end
+
+    manifest_path = Rails.root.join('tmp', 'fixture_builder.yml')
+    fixture_path = test_path('fixtures/magical_creatures.yml')
+    manifest_before = YAML.safe_load_file(manifest_path)
+    generated_fixture = YAML.safe_load_file(fixture_path)
+    generated_fixture['enty']['retired_column'] = 'bogus'
+    File.write(fixture_path, generated_fixture.to_yaml)
+    create_and_blow_away_old_db
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+
+    error = assert_raise(RuntimeError) do
+      FixtureBuilder.configure do |fbuilder|
+        fbuilder.files_to_check += Dir[test_path('*.rb')]
+        fbuilder.after_build = proc { raise 'after build failure' }
+        fbuilder.factory(&factory)
+      end
+    end
+
+    assert_equal 'after build failure', error.message
+    expected_hash = manifest_before.fetch('fixtures').fetch(File.basename(fixture_path))
+    assert_equal expected_hash, Digest::MD5.file(fixture_path).hexdigest
+    assert_false File.exist?(manifest_path)
+
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory(&factory)
+    end
+
+    manifest_after = YAML.safe_load_file(manifest_path)
+    assert_equal 3, builds
+    assert_equal 2, manifest_after['version']
+    assert_equal Digest::MD5.file(fixture_path).hexdigest,
+                 manifest_after.fetch('fixtures').fetch(File.basename(fixture_path))
+  end
+
+  def test_sha1_digests
+    create_and_blow_away_old_db
+    force_fixture_generation_due_to_differing_file_hashes
+
+    source_path = Pathname.new(test_path('fixture_builder_test.rb'))
+    FixtureBuilder.configure(use_sha1_digests: true) do |fbuilder|
+      fbuilder.files_to_check = [source_path]
+      fbuilder.factory do
+        @enty = MagicalCreature.create(name: 'Enty', species: 'ent',
+                                       powers: %w[shading rooting seeding])
+      end
+      manifest = YAML.safe_load_file(File.expand_path('../tmp/fixture_builder.yml', __dir__))
+      fixture_path = test_path('fixtures/magical_creatures.yml')
+      assert_equal Digest::SHA1.file(source_path).hexdigest,
+                   manifest.fetch('sources').fetch(source_path.to_s)
+      assert_equal Digest::SHA1.file(fixture_path).hexdigest,
+                   manifest.fetch('fixtures').fetch(File.basename(fixture_path))
+
+      first_modified_time = File.mtime(fixture_path)
       fbuilder.factory do
       end
       second_modified_time = File.mtime(test_path('fixtures/magical_creatures.yml'))
       assert_equal first_modified_time, second_modified_time
     end
   end
+
+  private
+
+  def assert_manifest_rebuilds(payload)
+    create_and_blow_away_old_db
+    force_fixture_generation
+    builds = 0
+    factory = proc do
+      builds += 1
+      @enty = MagicalCreature.create(name: 'Enty', species: 'ent')
+    end
+
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory(&factory)
+    end
+
+    manifest_path = File.expand_path('../tmp/fixture_builder.yml', __dir__)
+    File.write(manifest_path, payload)
+    FixtureBuilder.instance_variable_set(:'@configuration', nil)
+    FixtureBuilder.configure do |fbuilder|
+      fbuilder.files_to_check += Dir[test_path('*.rb')]
+      fbuilder.factory(&factory)
+    end
+
+    assert_equal 2, builds
+  end
+
+  def with_concurrency_harness
+    Dir.mktmpdir('fixture-builder-concurrency') do |directory|
+      harness = ConcurrencyHarness.new(directory: directory)
+      FileUtils.mkdir_p(harness.fixture_directory)
+      File.write(harness.source_path, "source\n")
+      yield harness
+    end
+  end
+
+  def spawn_worker(harness, role, scenario, worker_number:)
+    log_path = File.join(harness.directory, "#{role}.log")
+    pid = Process.spawn(
+      { 'TEST_ENV_NUMBER' => worker_number },
+      RbConfig.ruby,
+      '-I',
+      Rails.root.join('lib').to_s,
+      Rails.root.join('test/support/concurrency_worker.rb').to_s,
+      harness.directory,
+      role,
+      scenario,
+      chdir: Rails.root.to_s,
+      out: log_path,
+      err: [:child, :out]
+    )
+    WorkerProcess.new(pid: pid, log_path: log_path)
+  end
+
+  def wait_for_worker(worker)
+    status = Timeout.timeout(30) { Process.wait2(worker.pid).last }
+    WorkerResult.new(status: status, output: File.read(worker.log_path))
+  rescue Timeout::Error
+    terminate_worker(worker)
+    flunk "worker #{worker.pid} timed out: #{File.read(worker.log_path)}"
+  end
+
+  def terminate_worker(worker)
+    Process.kill('TERM', worker.pid)
+    Process.wait(worker.pid)
+  rescue Errno::ESRCH, Errno::ECHILD
+    nil
+  end
+
+  def wait_until
+    Timeout.timeout(30) do
+      sleep 0.01 until yield
+    end
+  end
+
+  def wait_for_worker_output(worker, content)
+    wait_until do
+      File.exist?(worker.log_path) && File.read(worker.log_path).include?(content)
+    end
+  end
+
+  def assert_manifest_matches_harness(harness)
+    manifest = YAML.safe_load_file(harness.manifest_path)
+    assert_equal Digest::MD5.file(harness.source_path).hexdigest,
+                 manifest.fetch('sources').fetch(harness.source_path)
+    assert_equal Digest::MD5.file(harness.fixture_path).hexdigest,
+                 manifest.fetch('fixtures').fetch(File.basename(harness.fixture_path))
+  end
+
 end
