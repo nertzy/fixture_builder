@@ -136,7 +136,7 @@ For all User fixture {first_name: 'foo', last_name: 'bar'} it would generate `fo
 There are also additional configuration options that can be changed to override the defaults:
 
 - files_to_check: array of filenames that when changed cause fixtures to be rebuilt
-- fixture_builder_file: the pathname of the file used to store file changes.
+- fixture_builder_file: the pathname of the manifest used to store source and generated fixture hashes
 - record_name_fields: array of field names to use as a fixture's name prefix, it will use the first matching field it finds
 - skip_tables: array of table names to skip building fixtures
 - select_sql: sql string to use for select
@@ -150,6 +150,14 @@ By default these are set as:
 - skip_tables: %w{ schema_migrations ar_internal_metadata }
 - select_sql: SELECT * FROM %{table}
 - delete_sql: DELETE FROM %{table}
+
+FixtureBuilder rebuilds fixtures when either a configured source file or generated
+fixture YAML differs from the manifest. Manifests written by versions that recorded
+only source hashes are rebuilt once and upgraded automatically.
+
+When multiple processes discover a stale snapshot, FixtureBuilder automatically
+allows one process to rebuild while the others wait and recheck the new snapshot.
+No application-level locking is required.
 
 # Sequence Collisions
 
