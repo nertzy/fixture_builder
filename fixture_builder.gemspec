@@ -27,7 +27,10 @@ Gem::Specification.new do |s|
 
   s.add_dependency 'activerecord', '>= 7.2'
   s.add_dependency 'activesupport', '>= 7.2'
+  s.add_dependency 'digest'
+  s.add_dependency 'fileutils'
   s.add_dependency 'hashdiff'
+  s.add_dependency 'tempfile'
   s.add_development_dependency 'rails', '>= 7.2'
   s.add_development_dependency 'rake'
   s.add_development_dependency 'sqlite3'
