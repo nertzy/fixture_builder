@@ -317,6 +317,22 @@ class CreateFixtures
  end
 ```
 
+# Downstream dependency tags
+
+When this fork is coupled to a downstream application, record each dependency
+update with a lightweight Git tag after the application change merges to its
+default branch.
+
+- Name the tag `<downstream>-<sha>`, where `<sha>` is the full SHA of the
+  merged downstream commit that updates the dependency.
+- Point the tag at the exact FixtureBuilder commit recorded by the lockfile in
+  that downstream application.
+- Do not tag before merge or use the dependency commit SHA, a source SHA from
+  replayed history, or an `Original-commit` trailer.
+
+This leaves a stable link from that downstream application's mainline history
+to the exact revision it uses.
+
 Copyright (c) 2009 Ryan Dy & David Stevenson, released under the MIT license
 
 Currently maintained by [Chad Woolley](mailto:thewoolleyman@gmail.com)
