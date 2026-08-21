@@ -20,6 +20,11 @@ The best of all worlds!
   or [pick which of the myriad seeds helper gems to use](https://rubygems.org/search?query=seed). _Just delete
   `seeds.rb` and forget about it!_
 
+# Requirements
+
+- Ruby 3.3+
+- Rails 8.0+
+
 # Installing
 
 1.  Install:
